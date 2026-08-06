@@ -6,12 +6,6 @@ import numpy as np
 import torch
 
 
-def set_all_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
 
 def print(*args, is_print_rank=True, **kwargs):
     """ Solves multi-process interleaved printing issue. """
@@ -23,6 +17,13 @@ def print(*args, is_print_rank=True, **kwargs):
             builtins.print(*args, **kwargs)
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
+
+def set_all_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 def to_readable_format(num, precision=3):
     num_str = str(num)
