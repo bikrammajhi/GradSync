@@ -65,7 +65,7 @@ modal run --detach modal_train.py          # TP4, seq_len 1024, mb 4, grad_acc 8
 ```
 
 produces 32,768-token steps and stops after `4,096,000` tokens (~125 steps).
-This larger sweep is what will be used for the convergence validation below.
+This larger sweep is the next validation milestone (see Roadmap).
 
 ## Configuration
 
@@ -103,16 +103,6 @@ full backward + optimizer step — and completed with no errors; it is a
 smoke test, not a correctness proof.
 
 Run: https://wandb.ai/iiserkbikram/picotron_tutorial/runs/h68lwer2
-
-### Validation protocol (pending)
-
-The sanity criterion for this framework is convergence parity: any parallel
-scheme must land on the same loss curve as the single-GPU baseline. The figure
-below is the **reference plot from the [picotron tutorial](https://github.com/huggingface/picotron_tutorial)** — the target this repo aims to reproduce.
-Re-running the smoke test with larger budgets (e.g. the default config above)
-should stay on that curve.
-
-![Reference convergence plot from the picotron tutorial — the baseline this project aims to match](images/sanity_check.png)
 
 ## Roadmap
 
