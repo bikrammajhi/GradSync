@@ -1,0 +1,12 @@
+# Core
+torch>=2.1.0
+transformers>=4.41.0
+datasets>=2.19.0
+sentencepiece
+
+# Training / observability
+wandb
+lovely-tensors
+
+# Fused kernels (see modal_train.py for the prebuilt wheel used on Modal)
+flash-attn
