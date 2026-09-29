@@ -34,37 +34,13 @@ def split_tensor_along_last_dim(
 
 
 class Reduce(torch.autograd.Function):
-    """
-    ╔═══════════════════════════════════════════════════════════════════════╗
-    ║            REDUCE: PARTIAL SUM AGGREGATION PRIMITIVE                  ║
-    ╠═══════════════════════════════════════════════════════════════════════╣
-    ║                                                                       ║
-    ║  PURPOSE                                                              ║
-    ║  Reconstructs a FULL tensor from PARTIAL outputs produced by          ║
-    ║  RowParallelLinear or VocabParallelEmbedding.                         ║
-    ║                                                                       ║
-    ║  ARCHITECTURAL PLACEMENT                                              ║
-    ║  • Output of RowParallelLinear (attention out_proj, MLP down_proj)    ║
-    ║  • Output of VocabParallelEmbedding (input boundary)                  ║
-    ║                                                                       ║
-    ║      RowParallel(W_i) ──► partial Y_i ──► Reduce.apply ──► Full Y     ║
-    ║                                               ▲                       ║
-    ║                                          This module                  ║
-    ║                                                                       ║
-    ║  FORWARD: AllReduce SUM                                               ║
-    ║  Each rank holds Y_i = X_i · W_i^T (a partial sum contribution).      ║
-    ║  The true result is Y = Σ_i Y_i. AllReduce performs this in-place.    ║
-    ║                                                                       ║
-    ║  BACKWARD: Identity                                                   ║
-    ║  ∇Y is already the correct gradient w.r.t. the summed output.         ║
-    ║  Each rank's local W_i receives its share naturally during backward.  ║
-    ║                                                                       ║
-    ║  COMMUNICATION PATTERN                                                ║
-    ║  Forward:  One AllReduce of shape [*, out_features]                   ║
-    ║  Backward: ZERO bytes transferred                                     ║
-    ║                                                                       ║
-    ║  ⚠️ MUTATES INPUT IN-PLACE via all_reduce.                            ║ 
-    ╚═══════════════════════════════════════════════════════════════════════╝
+    """All-reduce SUM primitive: aggregates sharded partial sums into a full tensor.
+
+    Used after RowParallelLinear and VocabParallelEmbedding.
+    Forward: in-place all-reduce SUM over the TP group.
+    Backward: identity (each rank's local shard receives its gradient naturally).
+
+    Note: mutates the input in-place via all_reduce.
     """
 
     @staticmethod
@@ -80,30 +56,13 @@ class Reduce(torch.autograd.Function):
 
 
 class Gather(torch.autograd.Function):
-    """
-    ╔═══════════════════════════════════════════════════════════════════════╗
-    ║             GATHER: OUTPUT RECONSTRUCTION PRIMITIVE                   ║
-    ╠═══════════════════════════════════════════════════════════════════════╣
-    ║                                                                       ║
-    ║  PURPOSE                                                              ║
-    ║  Reconstructs a FULL tensor from COLUMN-PARALLEL partial outputs      ║
-    ║  when the NEXT layer is NOT RowParallel.                              ║
-    ║                                                                       ║
-    ║  ARCHITECTURAL PLACEMENT                                              ║
-    ║  • final_proj output (logits head, gather_output=True)                ║
-    ║  • Any ColumnParallel whose consumer expects full hidden state        ║
-    ║                                                                       ║
-    ║  FORWARD: AllGather + Concatenate along last dim                      ║
-    ║  BACKWARD: Split grad_output along last dim, return local shard       ║
-    ║                                                                       ║
-    ║  COMMUNICATION PATTERN                                                ║
-    ║  Forward:  One AllGather of N × [*, out_features/N]                   ║
-    ║  Backward: ZERO bytes transferred (local split only)                  ║
-    ║                                                                       ║
-    ║  PERFORMANCE NOTE                                                     ║
-    ║  AllGather transfers N× more data than AllReduce. Prefer              ║
-    ║  Column→Row zero-copy handoff whenever architecture allows.           ║
-    ╚═══════════════════════════════════════════════════════════════════════╝
+    """All-gather primitive: concatenates column-parallel shards along the last dim.
+
+    Used where the consumer needs the full tensor (e.g. the final logits head
+    with gather_output=True). Prefer Column->Row zero-copy handoff when possible,
+    since all-gather moves N x more data than all-reduce.
+    Forward: all-gather + concat along last dim.
+    Backward: split grad along last dim, return this rank's shard (no comms).
     """
 
     @staticmethod
@@ -134,22 +93,11 @@ class Gather(torch.autograd.Function):
 
 
 class Copy(torch.autograd.Function):
-    """
-    ╔═══════════════════════════════════════════════════════════════════════╗
-    ║               COPY: INPUT REPLICATION PRIMITIVE                       ║
-    ╠═══════════════════════════════════════════════════════════════════════╣
-    ║                                                                       ║
-    ║  PURPOSE                                                              ║
-    ║  Bridges a REPLICATED input to a COLUMN-PARALLEL linear layer.        ║
-    ║                                                                       ║
-    ║  FORWARD: Identity (input is already replicated)                      ║
-    ║  BACKWARD: AllReduce SUM of partial gradients ∇X_i = W_i^T · ∇Y_i     ║
-    ║                                                                       ║
-    ║  INVARIANT                                                            ║
-    ║  Copy and Reduce are INVERSES in the autograd graph:                  ║
-    ║    Copy.forward  = Identity      ↔  Reduce.backward  = Identity       ║
-    ║    Copy.backward = AllReduce     ↔  Reduce.forward   = AllReduce      ║
-    ╚═══════════════════════════════════════════════════════════════════════╝
+    """Input-replication primitive bridging replicated inputs to column-parallel layers.
+
+    Forward: identity (input is already replicated on every rank).
+    Backward: all-reduce SUM of partial input gradients.
+    Copy and Reduce are autograd inverses of each other.
     """
 
     @staticmethod
@@ -169,35 +117,13 @@ class Copy(torch.autograd.Function):
 # =============================================================================
 
 class ColumnParallelLinear(nn.Module):
-    """
-    ╔═══════════════════════════════════════════════════════════════════════╗
-    ║        COLUMN PARALLEL LINEAR: OUTPUT-DIMENSION SHARDING              ║
-    ╠═══════════════════════════════════════════════════════════════════════╣
-    ║                                                                       ║
-    ║  MATHEMATICAL DEFINITION                                              ║
-    ║  Given Y = X · W^T + b where W ∈ R^{out × in}:                        ║
-    ║    W = [W_0; W_1; ...; W_{N-1}]   (vertical / row-wise split)         ║
-    ║    Y_i = X · W_i^T + b_i         (partial output per rank)            ║
-    ║                                                                       ║
-    ║  ARCHITECTURAL PLACEMENT                                              ║
-    ║  • Attention Q/K/V projections                                        ║
-    ║  • MLP up_proj and gate_proj                                          ║
-    ║  • Final output projection (with gather_output=True)                  ║
-    ║                                                                       ║
-    ║  EXECUTION FLOW                                                       ║
-    ║  1. Copy.apply(input) → ensures full X; backward: AllReduce ∇X        ║
-    ║  2. F.linear(X, W_i, b_i) → local GEMM producing partial Y_i          ║
-    ║  3. [Optional] Gather.apply(Y_i) if gather_output=True                ║
-    ║                                                                       ║
-    ║  ZERO-COPY HANDOFF                                                    ║
-    ║  When gather_output=False (DEFAULT), Y_i feeds directly into          ║
-    ║  RowParallelLinear as sharded input with NO communication.            ║
-    ║                                                                       ║
-    ║  WEIGHT INITIALIZATION                                                ║
-    ║  Master weight uses FULL fan-in: U(-√(1/in), √(1/in)), then sliced.   ║
-    ║                                                                       ║
-    ║  MEMORY PER RANK: (out/N) × in × dtype_bytes                          ║
-    ╚═══════════════════════════════════════════════════════════════════════╝
+    """Linear layer sharded along the output dimension: W = [W_0; ...; W_{N-1}].
+
+    Used for Q/K/V, MLP up/gate projections, and the final logits head
+    (with gather_output=True). With gather_output=False (default) the sharded
+    output feeds directly into a RowParallelLinear with zero communication.
+    Weights are initialized from full fan-in statistics, then sliced per rank.
+    Memory per rank: (out/N) x in.
     """
 
     def __init__(
@@ -267,36 +193,12 @@ class ColumnParallelLinear(nn.Module):
 
 
 class RowParallelLinear(nn.Module):
-    """
-    ╔═══════════════════════════════════════════════════════════════════════╗
-    ║         ROW PARALLEL LINEAR: INPUT-DIMENSION SHARDING                 ║
-    ╠═══════════════════════════════════════════════════════════════════════╣
-    ║                                                                       ║
-    ║  MATHEMATICAL DEFINITION                                              ║
-    ║  Given Y = X · W^T + b where W ∈ R^{out × in}:                        ║
-    ║    W = [W_0 | W_1 | ... | W_{N-1}]   (horizontal / col-wise split)    ║
-    ║    X = [X_0 | X_1 | ... | X_{N-1}]   (matching input partition)       ║
-    ║    Y_i = X_i · W_i^T                 (partial sum contribution)       ║
-    ║    Y   = Σ_i Y_i + b                 (AllReduce reconstructs full Y)  ║
-    ║                                                                       ║
-    ║  ARCHITECTURAL PLACEMENT                                              ║
-    ║  • Attention out_proj                                                 ║
-    ║  • MLP down_proj                                                      ║
-    ║                                                                       ║
-    ║  EXECUTION FLOW                                                       ║
-    ║  1. F.linear(X_i, W_i) → partial sum Y_i (NO bias yet)                ║
-    ║  2. Reduce.apply(Y_i) → AllReduce SUM → Full Y (without bias)         ║
-    ║  3. Y + b → Bias added AFTER collective to avoid N× overcounting      ║
-    ║                                                                       ║
-    ║  INPUT CONTRACT                                                       ║
-    ║  Expects SHARDED input X_i of shape [*, in/N].                        ║
-    ║  Typically from ColumnParallelLinear(gather=False) via zero-copy.     ║
-    ║                                                                       ║
-    ║  WEIGHT INITIALIZATION                                                ║
-    ║  Master weight uses FULL fan-in: U(-√(1/in), √(1/in)), then sliced.   ║
-    ║                                                                       ║
-    ║  MEMORY PER RANK: out × (in/N) × dtype_bytes + full bias              ║
-    ╚═══════════════════════════════════════════════════════════════════════╝
+    """Linear layer sharded along the input dimension: Y = sum_i(X_i @ W_i^T) + b.
+
+    Used for attention out_proj and MLP down_proj. Expects the sharded input
+    produced by a preceding ColumnParallelLinear (zero-copy handoff). The bias
+    is added AFTER the all-reduce so it isn't counted N times.
+    Memory per rank: out x (in/N), plus a full bias.
     """
 
     def __init__(self, in_features: int, out_features: int, bias: bool):
@@ -360,37 +262,12 @@ class RowParallelLinear(nn.Module):
 
 
 class VocabParallelEmbedding(nn.Module):
-    """
-    ╔═══════════════════════════════════════════════════════════════════════╗
-    ║          VOCAB-PARALLEL EMBEDDING: RANGE-BASED MASKING                ║
-    ╠═══════════════════════════════════════════════════════════════════════╣
-    ║                                                                       ║
-    ║  ARCHITECTURAL PLACEMENT                                              ║
-    ║  This module exists ONLY at the input boundary of the transformer     ║
-    ║  stack. It is the sole point where discrete token IDs interact with   ║
-    ║  TP sharding logic.                                                   ║
-    ║                                                                       ║
-    ║      Token IDs ──► [THIS MODULE] ──► Full Hidden State                ║
-    ║                                                                       ║
-    ║  SHARDING STRATEGY                                                    ║
-    ║  Global embedding table E[V × D] partitioned along dim-0 (vocab):     ║
-    ║    Rank i owns E_i[vocab_start_i : vocab_end_i, :]                    ║
-    ║    Constraint: V must be divisible by N.                              ║
-    ║                                                                       ║
-    ║  FORWARD PASS (4 local steps + 1 collective)                          ║
-    ║  ① MASK:   mask = (token < start) | (token >= end)                    ║
-    ║  ② SHIFT:  shifted = token - start; shifted[mask] = 0                 ║
-    ║  ③ LOOKUP: output = F.embedding(shifted, self.weight)                 ║
-    ║  ④ ZERO:   output[mask, :] = 0.0                                      ║
-    ║  ⑤ SUM:    Reduce.apply(output) → AllReduce recovers global embed     ║
-    ║                                                                       ║
-    ║  BACKWARD                                                             ║
-    ║  Gradients for non-owned tokens are NATURALLY ZERO because forward    ║
-    ║  output was zeroed at Step ④. No explicit grad masking needed.        ║
-    ║                                                                       ║
-    ║  OUTPUT CONTRACT                                                      ║
-    ║  Returns FULL embedding [*, D] identical to non-parallel Embedding.   ║
-    ╚═══════════════════════════════════════════════════════════════════════╝
+    """Embedding table sharded along the vocab dimension; rank i owns rows [start_i, end_i).
+
+    Forward: mask out-of-range tokens, look up local rows, zero invalid positions,
+    then all-reduce SUM (exactly one rank contributes per token). Returns the full
+    embedding, identical to a non-parallel nn.Embedding. Gradients for non-owned
+    tokens are naturally zero, so no explicit grad masking is needed.
     """
 
     def __init__(
@@ -467,15 +344,7 @@ class VocabParallelEmbedding(nn.Module):
         self.weight.data.copy_(weight_list[self.tp_rank])
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """Range-masked embedding lookup with AllReduce aggregation.
-
-        Steps:
-            1. Mask tokens outside this rank's vocab range
-            2. Shift valid tokens to local index space; clamp OOV to 0
-            3. Perform local embedding lookup
-            4. Zero out embeddings for OOV tokens
-            5. AllReduce SUM to recover correct global embedding
-        """
+        """Range-masked lookup + all-reduce SUM to recover the global embedding."""
         # ① Build validity mask
         input_mask = (input < self.vocab_start_index) | (
             input >= self.vocab_end_index

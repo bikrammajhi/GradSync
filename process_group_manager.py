@@ -4,11 +4,14 @@ import torch.distributed as dist
 
 class ProcessGroupManager:
     def __init__(self, dp_size, pp_size, tp_size):
+        self.dp_size = dp_size
+        self.pp_size = pp_size
+        self.tp_size = tp_size
         self.global_rank = dist.get_rank()
         self.world_size = dist.get_world_size()
         self.local_rank = int(os.environ.get("LOCAL_RANK", self.global_rank % self.world_size))
-        
-        assert self.world_size == dp_size * pp_size * tp_size, f"World size ({self.world_size}) != DP ({self.dp_size}) * PP ({self.pp_size}) * TP ({self.tp_size})"
+
+        assert self.world_size == dp_size * pp_size * tp_size, f"World size ({self.world_size}) != DP ({dp_size}) * PP ({pp_size}) * TP ({tp_size})"
 
         self.grid = torch.arange(self.world_size).view(dp_size, pp_size, tp_size)  # DP * PP * TP grid
         # Find the position of the current process in the grid

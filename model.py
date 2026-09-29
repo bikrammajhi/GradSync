@@ -6,22 +6,22 @@ from flash_attn.layers.rotary import apply_rotary_emb
 from flash_attn.ops.triton.layer_norm import layer_norm_fn
 import process_group_manager as pgm
 
-def flash_attention(q, k, v, causal = True):
-    q = q.permute(0, 2, 1, 3) # [batch_size, seq_length, num_head , head_dim]
-    k = k.permute(0, 2, 1, 3) # [batch_size, seq_length, num_head , head_dim]
-    v = v.permute(0, 2, 1, 3) # [batch_size, seq_length, num_head , head_dim]
+def flash_attention(q, k, v, causal=True):
+    # q/k/v: [batch_size, seq_length, num_heads, head_dim] -> [batch_size, num_heads, seq_length, head_dim]
+    q = q.permute(0, 2, 1, 3)
+    k = k.permute(0, 2, 1, 3)
+    v = v.permute(0, 2, 1, 3)
     return flash_attn_func(q, k, v, causal=causal)
 
-def get_cos_sin(seq_length, head_dim, base=500000.0):
-    assert head_dim%2==0
-    # Results on CUDA and CPU are different even with the same formula, To match transformers implementation. frequency should be computed on CPU
-    theta = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.int64).float().to('cpu') / head_dim))
-    dtype = torch.bfloat16
-    device = torch.device('cuda')
-    position = torch.arange(seq_length).to(device).unsqueeze(1).float() # [seq_length, 1]
-    # To match transformers implementation. m * theta should be computed on GPU
+def get_cos_sin(seq_length, head_dim, base=500000.0, device=None, dtype=torch.bfloat16):
+    assert head_dim % 2 == 0
+    # Frequency computed on CPU to match the transformers implementation exactly.
+    theta = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.int64).float() / head_dim))
+    device = device if device is not None else torch.device('cuda')
+    position = torch.arange(seq_length, device=device).unsqueeze(1).float()  # [seq_length, 1]
+    # m * theta computed on the target device to match transformers.
     theta = theta.to(device)
-    return torch.cos(position.float()*theta.float()).to(dtype).repeat(1,2), torch.sin(position.float()*theta.float()).to(dtype).repeat(1,2) # [seq_length, head_dim], [seq_length, head_dim]
+    return torch.cos(position * theta).to(dtype).repeat(1, 2), torch.sin(position * theta).to(dtype).repeat(1, 2)  # [seq_length, head_dim] each
 
 class TritonRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-5, device=None, dtype=None):
@@ -98,8 +98,9 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        #TODO: dont do single line operations as it is harder to debug
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate = F.silu(self.gate_proj(x))
+        up = self.up_proj(x)
+        return self.down_proj(gate * up)
 
 class DecoderLayer(nn.Module):
     # TritonRMSNorm -> Attention -> Residual -> TritonRMSNorm -> MLP -> Residual
@@ -111,7 +112,10 @@ class DecoderLayer(nn.Module):
         self.mlp = MLP(config)
         self.layer_idx = layer_idx
         head_dim = config.hidden_size // config.num_attention_heads
-        self.cos, self.sin = get_cos_sin(config.max_position_embeddings, head_dim=head_dim , base=config.rope_theta) # [max_position_embeddings, head_dim]
+        cos, sin = get_cos_sin(config.max_position_embeddings, head_dim=head_dim, base=config.rope_theta)
+        # Registered as buffers so they move with .to(device/dtype) and are saved with state_dict.
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
 
     def forward(self, x, attention_mask = None, position_ids = None):
         cos, sin = self.cos, self.sin 

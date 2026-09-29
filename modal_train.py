@@ -1,8 +1,13 @@
 """Run the GradSync TP training on Modal.
 
 Usage:
-    modal secret create wandb WANDB_API_KEY=xxx   # optional, enables --use_wandb
-    modal run --detach modal_train.py
+    modal run modal_train.py --tp-size 2 --max-tokens 204800 --seq-len 256 \\
+        --micro-batch-size 2 --gradient-accumulation-steps 4 \\
+        --num-hidden-layers 8 --num-proc 8
+
+    Optional wandb logging:
+    modal secret create gradsync-wandb WANDB_API_KEY=xxx
+    GRADSYNC_WANDB_SECRET=gradsync-wandb modal run modal_train.py --tp-size 2 ...
 """
 import os
 import subprocess
@@ -22,7 +27,6 @@ image = (
         "numpy==1.26.4",
         "datasets==2.19.1",
         "transformers==4.41.1",
-        "lovely-tensors",
         "sentencepiece",
         "wandb",
     )
@@ -35,10 +39,14 @@ image = (
     .add_local_file("utils.py", "/root/utils.py")
 )
 
-try:
-    _wandb_secret = modal.Secret.from_name("wandb", required_keys=["WANDB_API_KEY"])
-except modal.exception.NotFoundError:
-    _wandb_secret = None
+# Optional wandb secret. Set GRADSYNC_WANDB_SECRET to a Modal secret name holding
+# WANDB_API_KEY to enable --use_wandb; unset (default) runs without wandb.
+# NOTE: Secret.from_name resolves lazily at deploy time, so this must be gated
+# on an env var — a try/except around from_name cannot catch a missing secret.
+_WANDB_SECRET_NAME = os.environ.get("GRADSYNC_WANDB_SECRET", "")
+_WANDB_SECRETS = (
+    [modal.Secret.from_name(_WANDB_SECRET_NAME)] if _WANDB_SECRET_NAME else []
+)
 
 
 def _build_cmd(
@@ -66,7 +74,7 @@ def _build_cmd(
         "--num_key_value_heads", "4",
         "--run_name", "tp_1B",
     ]
-    if _wandb_secret is not None:
+    if _WANDB_SECRET_NAME:
         cmd.append("--use_wandb")
     return cmd
 
@@ -89,9 +97,7 @@ def _run(
         num_proc=num_proc,
         tp_size=tp_size,
     )
-    env = os.environ.copy()
-    env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-    subprocess.run(cmd, cwd="/root", env=env, check=True)
+    subprocess.run(cmd, cwd="/root", check=True)
 
 
 @app.function(
@@ -99,7 +105,7 @@ def _run(
     gpu="a100-40gb:2",
     cpu=16.0,
     timeout=2 * 60 * 60,
-    secrets=[_wandb_secret] if _wandb_secret else [],
+    secrets=_WANDB_SECRETS,
 )
 def run_tp2(**kwargs):
     _run(tp_size=2, **kwargs)
@@ -110,7 +116,7 @@ def run_tp2(**kwargs):
     gpu="a100-40gb:4",
     cpu=32.0,
     timeout=2 * 60 * 60,
-    secrets=[_wandb_secret] if _wandb_secret else [],
+    secrets=_WANDB_SECRETS,
 )
 def run_tp4(**kwargs):
     _run(tp_size=4, **kwargs)

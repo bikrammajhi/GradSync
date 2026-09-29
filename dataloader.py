@@ -81,32 +81,10 @@ class MicroBatchDataLoader(DataLoader):
 
     def collate_batch(self, batch):
         batch_input_ids = torch.stack([torch.tensor(item['input_ids']) for item in batch])
-        batch_size = batch_input_ids.size(0)
         input_ids = batch_input_ids[:, :-1].contiguous()
         target_ids = batch_input_ids[:, 1:].contiguous()
-        position_ids = torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1).contiguous()
-        attn_mask = torch.tril(torch.ones((self.seq_len, self.seq_len), dtype=torch.bool))
-        attn_mask = attn_mask.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
-        
+
         return {
             "input_ids": input_ids,
             "target_ids": target_ids,
-            "position_ids": position_ids,
-            "attn_mask": attn_mask,
-            "hidden_states": None
         }
-    
-    def __iter__(self):
-        if self._iterator is None:
-            self._iterator = super().__iter__()
-        return self
-
-    def __next__(self):
-        if self._iterator is None:
-            self._iterator = super().__iter__()
-        try:
-            batch = next(self._iterator)
-        except StopIteration:
-            self._iterator = None
-            raise StopIteration
-        return batch

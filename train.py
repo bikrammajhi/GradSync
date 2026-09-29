@@ -12,8 +12,6 @@ import argparse
 from torch.optim import AdamW
 from transformers import AutoConfig
 
-import lovely_tensors as lt; lt.monkey_patch()
-
 from model import Llama
 from dataloader import MicroBatchDataLoader
 import process_group_manager as pgm
@@ -22,12 +20,12 @@ from utils import set_all_seed, print, to_readable_format
 
 from tensor_parallel import apply_tensor_parallel
 
-def train_step(model, dataloader, device):
+def train_step(model, data_iter, dataloader, device):
     acc_loss = 0.0
 
     for i in range(dataloader.grad_acc_steps):
         # get the next batch
-        batch = next(dataloader)
+        batch = next(data_iter)
         input_ids = batch["input_ids"].to(device)
         target_ids = batch["target_ids"].to(device)
 
@@ -86,7 +84,6 @@ if __name__ == "__main__":
     # Set environment variables
     os.environ["OMP_NUM_THREADS"] = args.omp_num_threads
     os.environ["TOKENIZERS_PARALLELISM"] = args.tokenizers_parallelism
-    os.environ["DEVICE"] = "cuda"
     
     local_rank = int(os.environ["LOCAL_RANK"])
     global_rank = int(os.environ["RANK"])
@@ -104,7 +101,7 @@ if __name__ == "__main__":
 
     if is_wandb_rank and args.use_wandb:
         wandb.init(
-            project="picotron_tutorial",
+            project="gradsync",
             name=f"{args.run_name}_{pgm.process_group_manager}",
             config={
                 "tensor_parallel_size": pgm.process_group_manager.tp_world_size,
@@ -130,8 +127,6 @@ if __name__ == "__main__":
     model.to(dtype).to(device)
     model.train()
 
-    dist.barrier()
-
     optimizer = AdamW(model.parameters(), lr=args.learning_rate)
 
     dist.barrier()
@@ -153,6 +148,7 @@ if __name__ == "__main__":
         print("Tokens per step:", to_readable_format(tokens_per_step), is_print_rank=is_wandb_rank)
 
     trained_token, step = 0, 0
+    data_iter = iter(dataloader)
 
     dist.barrier()
 
@@ -162,7 +158,7 @@ if __name__ == "__main__":
         step_start_time = time.time()
         optimizer.zero_grad()
 
-        loss = train_step(model, dataloader, device)
+        loss = train_step(model, data_iter, dataloader, device)
 
         optimizer.step()
 
@@ -180,8 +176,8 @@ if __name__ == "__main__":
         )
         
         if is_wandb_rank and args.use_wandb:
-            wandb.log({"loss": loss, "tokens_per_step": tokens_per_step, "tokens_per_second": tokens_per_step / step_duration,\
-                "memory_usage": torch.cuda.memory_reserved() / 1e9, "trained_tokens": tokens_per_step})
+            wandb.log({"loss": loss, "tokens_per_step": tokens_per_step, "tokens_per_second": tokens_per_step / step_duration,
+                "memory_usage": torch.cuda.memory_reserved() / 1e9, "trained_tokens": trained_token})
 
     if is_wandb_rank and args.use_wandb:
         wandb.finish()

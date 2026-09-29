@@ -1,18 +1,14 @@
 import torch
 import random
 import numpy as np
-import builtins
-import fcntl
+
 
 def print(*args, is_print_rank=True, **kwargs):
-    """ solves multi-process interleaved print problem """
-    if not is_print_rank: return
-    with open(__file__, "r") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            builtins.print(*args, **kwargs)
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+    """Rank-guarded print; pass is_print_rank=False on non-logging ranks."""
+    if not is_print_rank:
+        return
+    import builtins
+    builtins.print(*args, flush=True, **kwargs)
 
 def set_all_seed(seed):
     for module in [random, np.random]: module.seed(seed)

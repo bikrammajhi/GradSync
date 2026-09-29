@@ -5,7 +5,8 @@ directly on `torch.distributed`. The parallel primitives are implemented by hand
 — no Megatron, no DeepSpeed — so you can read exactly what a tensor-parallel
 training step does under the hood.
 
-**Status:** tensor parallelism (TP) is implemented and smoke-tested on 2×A100.
+**Status:** tensor parallelism (TP) is implemented and validated with a 100-step
+convergence run on 2×A100 (see [Results](#results)).
 Data- and pipeline-parallelism are planned (see [Roadmap](#roadmap)).
 
 The current build ships:
@@ -25,44 +26,55 @@ The current build ships:
 
 ## Quick Start
 
-One-step smoke test (the config that has been run and validated), on Modal
+100-step training run (the config that has been run and validated), on Modal
 2 × A100 with TP=2:
 
 ```bash
-modal run --detach modal_train.py --tp-size 2 \
-  --max-tokens 64 --seq-len 64 --micro-batch-size 1 \
-  --gradient-accumulation-steps 1 --num-hidden-layers 8 --num-proc 8
+modal run modal_train.py --tp-size 2 --max-tokens 204800 --seq-len 256 \
+  --micro-batch-size 2 --gradient-accumulation-steps 4 \
+  --num-hidden-layers 8 --num-proc 8
 ```
 
 Or, locally, the same run with `torchrun --nproc_per_node 2` and the same
-arguments on `--tp_size`, `--max_tokens`, etc. Both terminate after exactly one
-optimizer step (64 tokens).
+arguments on `--tp_size`, `--max_tokens`, etc.
 
-## Results — TP smoke test
+## Results
 
-Run on **Modal (2 × A100-40GB)**, TP=2 · DP=1 · PP=1, 2026-08-08:
+Run on **Modal (2 × A100-40GB)**, TP=2 · DP=1 · PP=1, 2026-09-29:
 
 | Metric | Value |
 |---|---|
-| Model | TinyLlama/TinyLlama_v1.1 (8 decoder layers, 32 heads, 4 KV heads, bf16) |
-| Sequence length | 64 |
-| Micro-batch × grad-accum | 1 × 1 (64 tokens/step) |
-| Steps run | 1 (smoke test) |
-| **Loss** | **10.5625** |
-| **GPU memory / GPU** | **2.56 GB** |
+| Model | TinyLlama/TinyLlama_v1.1 base config, 8 decoder layers, 32 heads, 4 KV heads, bf16 |
+| Dataset | roneneldan/TinyStories |
+| Sequence length | 256 |
+| Micro-batch × grad-accum | 2 × 4 (2,048 tokens/step) |
+| Optimizer | AdamW, lr 3e-4, seed 42 |
+| Steps run | 100 (204,800 tokens) |
+| **Loss: step 1 → step 100** | **10.5625 → 3.6562** |
+| **Throughput** | **~12.8K tokens/s (~6.4K/s/GPU)** |
+| **GPU memory / GPU** | **2.66 GB** |
 
-A randomly initialized 32k-vocab model has expected loss `ln(32000) ≈ 10.37`;
-the measured 10.56 is consistent with that. The single step exercised the whole
-TP machinery — `Copy`/`Reduce`/`Gather` collectives, sharded embeddings, and a
-full backward + optimizer step — and completed with no errors; it is a
-smoke test, not a correctness proof.
+Loss curve (training loss, TinyStories):
 
-[wandb run](https://wandb.ai/iiserkbikram/picotron_tutorial/runs/h68lwer2)
+| Step | 1 | 10 | 25 | 50 | 75 | 100 |
+|---|---|---|---|---|---|---|
+| Loss | 10.56 | 5.85 | 5.06 | 4.20 | 4.28 | 3.66 |
+
+![100-step training loss curve](images/loss_curve_100steps.png)
+
+Step 1 reproduces the random-init expectation (`ln(32000) ≈ 10.37`), and the
+steady drop to 3.66 over 100 steps exercises the full TP path — `Copy`/`Reduce`/
+`Gather` collectives, sharded embeddings, and backward + optimizer through the
+sharded layers — showing the tensor-parallel model actually learns.
+
+[Modal app run](https://modal.com/apps/bikrammajhi/main/ap-uIU0a8VIYJKArulYwFzzUU) —
+reproduce with the Quick Start command above (exactly 100 steps: 100 × 2,048 =
+204,800 `--max-tokens`).
 
 ## Roadmap
 
 - [x] Model + process-group grid + chunked dataloader
-- [x] Tensor parallelism — smoke-tested on 2×A100
+- [x] Tensor parallelism — validated on 2×A100 (100-step run, 10.56 → 3.66)
 - [ ] Data parallelism — naive and bucketed gradient all-reduce
 - [ ] Pipeline parallelism — 1F1B / AFAB schedules
 - [ ] 3D-parallel run + convergence-curve validation
@@ -72,8 +84,6 @@ smoke test, not a correctness proof.
 - [Picotron tutorial repo](https://github.com/huggingface/picotron_tutorial) — the
   canonical "from-scratch" series this repo builds on
 - [Modal](https://modal.com) — the managed GPU runner used for validation
-- [wandb run](https://wandb.ai/iiserkbikram/picotron_tutorial/runs/h68lwer2) — the
-  TP smoke test
 
 *Built for understanding — every communication call lands on a single
 `torch.distributed` collective; nothing is hidden behind a framework.*
